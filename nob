@@ -80,18 +80,17 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 
 def md_to_html(md_lines):
     html = []
-    in_list = False
+    list_stack = []  # Track (indent_level, tag)
     in_blockquote = False
     in_codeblock = False
     codeblock_lines = []
     codeblock_fence = None
     para_buffer = []
 
-    def close_list():
-        nonlocal in_list
-        if in_list:
+    def close_lists_to(level):
+        while list_stack and list_stack[-1][0] >= level:
             html.append("</ul>")
-            in_list = False
+            list_stack.pop()
 
     def close_blockquote():
         nonlocal in_blockquote
@@ -102,7 +101,6 @@ def md_to_html(md_lines):
     def flush_paragraph():
         nonlocal para_buffer
         if para_buffer:
-            # Join lines with spaces, strip leading/trailing whitespace
             paragraph = ' '.join(line.strip() for line in para_buffer).strip()
             if paragraph:
                 html.append(f"<p>{inline_format(paragraph)}</p>")
@@ -112,19 +110,13 @@ def md_to_html(md_lines):
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def inline_format(text):
-        # Images: ![alt](src)
         text = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', r'<img src="\2" alt="\1">', text)
-        # Links: [text](url)
         text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
-        # Bold: **text** or __text__
         text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
         text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
-        # Italic: *text* or _text_
         text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
         text = re.sub(r'_(.+?)_', r'<i>\1</i>', text)
-        # Underline: ++text++
         text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
-        # Inline code: `code`
         text = re.sub(r'`(.+?)`', r'<tt>\1</tt>', text)
         return text
 
@@ -136,19 +128,16 @@ def md_to_html(md_lines):
         fence_match = re.match(r'^(```|~~~)', line)
         if fence_match:
             flush_paragraph()
-            fence = fence_match.group(1)
-            if not in_codeblock:
-                close_list()
-                close_blockquote()
-                in_codeblock = True
-                codeblock_fence = fence
+            close_lists_to(0)
+            close_blockquote()
+            in_codeblock = not in_codeblock
+            if in_codeblock:
+                codeblock_fence = fence_match.group(1)
                 codeblock_lines = []
-            elif fence == codeblock_fence:
-                # End of code block
+            else:
                 html.append('<pre><tt>{}</tt></pre>'.format(
                     escape_html('\n'.join(codeblock_lines))
                 ))
-                in_codeblock = False
                 codeblock_fence = None
             i += 1
             continue
@@ -158,18 +147,16 @@ def md_to_html(md_lines):
             i += 1
             continue
 
-        # Indented code block (4 spaces or tab)
-        if (line.startswith('    ') or line.startswith('\t')) and not in_list and not in_blockquote:
+        # Indented code block (4 spaces or tab) -- only if not a list item!
+        if (line.startswith('    ') or line.startswith('\t')) and not re.match(r'^\s*([-*+])\s+', line):
             flush_paragraph()
-            close_list()
+            close_lists_to(0)
             close_blockquote()
             codeblock_lines = []
             while i < len(md_lines):
                 l = md_lines[i].rstrip('\n')
-                if l.startswith('    '):
-                    codeblock_lines.append(l[4:])
-                elif l.startswith('\t'):
-                    codeblock_lines.append(l[1:])
+                if (l.startswith('    ') or l.startswith('\t')) and not re.match(r'^\s*([-*+])\s+', l):
+                    codeblock_lines.append(l[4:] if l.startswith('    ') else l[1:])
                 else:
                     break
                 i += 1
@@ -181,7 +168,7 @@ def md_to_html(md_lines):
         # Paragraph boundary: empty line
         if not line.strip():
             flush_paragraph()
-            close_list()
+            close_lists_to(0)
             close_blockquote()
             i += 1
             continue
@@ -190,7 +177,7 @@ def md_to_html(md_lines):
         m = re.match(r'^(#{1,6})\s+(.*)', line)
         if m:
             flush_paragraph()
-            close_list()
+            close_lists_to(0)
             close_blockquote()
             level = len(m.group(1))
             html.append(f"<h{level}>{inline_format(m.group(2))}</h{level}>")
@@ -201,7 +188,7 @@ def md_to_html(md_lines):
         if line.startswith('>'):
             flush_paragraph()
             if not in_blockquote:
-                close_list()
+                close_lists_to(0)
                 html.append("<blockquote>")
                 in_blockquote = True
             html.append(inline_format(line[1:].lstrip()))
@@ -210,26 +197,33 @@ def md_to_html(md_lines):
         else:
             close_blockquote()
 
-        # Unordered list
-        m = re.match(r'^[-*+]\s+(.*)', line)
+        # Unordered list (with nesting and bullet type)
+        m = re.match(r'^(\s*)([-*+])\s+(.*)', line)
         if m:
             flush_paragraph()
-            if not in_list:
-                close_blockquote()
+            indent = len(m.group(1).replace('\t', '    '))
+            bullet = m.group(2)
+            content = m.group(3)
+
+            # Open new lists or close as needed
+            while list_stack and (indent < list_stack[-1][0]):
+                html.append("</ul>")
+                list_stack.pop()
+            if not list_stack or indent > list_stack[-1][0]:
                 html.append("<ul>")
-                in_list = True
-            html.append(f"<li>{inline_format(m.group(1))}</li>")
+                list_stack.append((indent, bullet))
+            html.append(f"<li>{inline_format(content)}</li>")
             i += 1
             continue
         else:
-            close_list()
+            close_lists_to(0)
 
         # Otherwise, buffer for paragraph
         para_buffer.append(line)
         i += 1
 
     flush_paragraph()
-    close_list()
+    close_lists_to(0)
     close_blockquote()
     return '\n'.join(html)
 
